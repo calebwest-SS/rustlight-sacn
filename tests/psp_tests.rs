@@ -34,7 +34,10 @@ use std::time::Duration;
 const TEST_UNIVERSE: u16 = 1;
 
 /// Builds a minimal AcnRootLayerProtocol byte buffer for a data packet with the given
-/// property_values (which includes the START Code as the first byte).
+/// `property_values`.
+///
+/// Callers must provide the complete DMP property values payload, including the START Code
+/// as the first byte.
 ///
 /// Returns the packed bytes.
 fn build_data_packet_bytes(

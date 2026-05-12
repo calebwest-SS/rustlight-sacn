@@ -393,6 +393,8 @@ impl fmt::Debug for SacnReceiver {
         write!(f, "{:?}", self.partially_discovered_sources)?;
         #[cfg(feature = "psp")]
         write!(f, "per_slot_priority_mode: {:?}", self.per_slot_priority_mode)?;
+        #[cfg(not(feature = "psp"))]
+        write!(f, "per_slot_priority_mode: N/A")?;
         Ok(())
     }
 }

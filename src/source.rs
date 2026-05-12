@@ -1323,7 +1323,9 @@ impl SacnSourceInternal {
                 cid: self.cid,
                 data: E131RootLayerData::DataPacket(DataPacketFramingLayer {
                     source_name: self.name.as_str().into(),
-                    // PSP packet priority field should match the NSC packet priority; default 100.
+                    // Use the protocol default packet priority for PSP packets.
+                    // Matching a universe's live NSC packet priority would require tracking that
+                    // priority in sender state, which this implementation does not currently do.
                     priority: E131_DEFAULT_PRIORITY,
                     synchronization_address: NO_SYNC_UNIVERSE,
                     sequence_number: sequence,
