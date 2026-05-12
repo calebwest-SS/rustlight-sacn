@@ -93,7 +93,7 @@ const DEFAULT_MERGE_FUNC: fn(&DMXData, &DMXData) -> Result<DMXData> =
     discard_lowest_priority_then_previous;
 
 /// The default value for the `per_slot_priority_mode` flag on newly created receivers.
-/// Disabled by default so that existing users see no behaviour change.
+/// Disabled by default so that existing users see no behavior change.
 const PER_SLOT_PRIORITY_MODE_DEFAULT: bool = false;
 
 /// Per-source, per-universe state for the BSR E1.31-1 Per-Slot Priority (PSP) state machine.
