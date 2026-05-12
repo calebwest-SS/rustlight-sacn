@@ -516,6 +516,40 @@ impl SacnSource {
     pub fn universes(&self) -> Result<Vec<u16>> {
         Ok(unlock_internal(&self.internal)?.universes())
     }
+
+    #[cfg(feature = "psp")]
+    /// Sends a Per-Slot Priority (PSP) packet for the given universe as defined in BSR E1.31-1.
+    ///
+    /// A PSP packet carries per-slot priority values (START Code `0xDD`) allowing a source to
+    /// advertise a different priority for each individual DMX slot.  The sequence number for PSP
+    /// packets is shared with NSC data packets so receivers can detect out-of-order delivery.
+    ///
+    /// Per the BSR E1.31-1 specification, senders should transmit at least `PSP_STARTUP_MIN_PACKETS`
+    /// PSP packets within `PSP_STARTUP_WINDOW` before receivers will transition to
+    /// `ActivePerSlot` mode.
+    ///
+    /// # Arguments
+    /// universe:    The sACN universe to send the PSP packet on.  Must be registered.
+    /// priorities:  A slice of up to 512 per-slot priority values in the range `[0, 200]`.
+    ///              A value of `0` indicates the source is releasing that slot.
+    /// `dst_ip`:    Unicast destination, or `None` for IP multicast.
+    ///
+    /// # Errors
+    /// See `SacnSourceInternal::send_per_slot_priority` for the full list of possible errors.
+    ///
+    /// `SourceCorrupt`: Returned if the Mutex is poisoned.
+    pub fn send_per_slot_priority(
+        &mut self,
+        universe: u16,
+        priorities: &[u8],
+        dst_ip: Option<SocketAddr>,
+    ) -> Result<()> {
+        unlock_internal_mut(&mut self.internal)?.send_per_slot_priority(
+            universe,
+            priorities,
+            dst_ip,
+        )
+    }
 }
 
 /// By implementing the Drop trait for `SacnSource` it means that the user doesn't have to explicitly clean up the source
@@ -1218,6 +1252,120 @@ impl SacnSourceInternal {
     /// Returns the universes currently registered on this source.
     pub fn universes(&self) -> Vec<u16> {
         self.universes.clone()
+    }
+
+    #[cfg(feature = "psp")]
+    /// Sends a Per-Slot Priority (PSP) packet for the given universe as defined in BSR E1.31-1.
+    ///
+    /// A PSP packet uses START Code `0xDD` and carries per-slot priority bytes rather than DMX levels.
+    /// The sequence number for PSP packets is shared with NSC data packets on the same universe so that
+    /// receivers can detect out-of-order delivery across both packet types (as required by the spec).
+    ///
+    /// # Arguments
+    /// universe:    The sACN universe to send the PSP packet on.  Must be registered on this source.
+    /// priorities:  A slice of up to 512 priority values.  Each value must be in the range `[0, 200]`;
+    ///              a value of `0` releases the source's control of that slot.  If fewer than 512
+    ///              values are provided the remaining slots are implicitly treated as priority `0` by
+    ///              receivers.
+    /// `dst_ip`:    The destination IP address for unicast delivery, or `None` to use IP multicast.
+    ///
+    /// # Errors
+    /// `SenderAlreadyTerminated`: Returned if the source has been terminated.
+    ///
+    /// `IllegalUniverse`: Returned if the universe is outside the allowed range.
+    ///
+    /// `UniverseNotRegistered`: Returned if the universe has not been registered on this source.
+    ///
+    /// `ExceedUniverseCapacity`: Returned if `priorities` contains more than 512 values.
+    ///
+    /// `InvalidPriority`: If any priority value exceeds `E131_MAX_PRIORITY` (200) this call returns an
+    ///                     error.  The caller should clamp or validate priorities before calling.
+    ///
+    /// Io: Returned if the packet cannot be sent on the underlying socket.
+    fn send_per_slot_priority(
+        &self,
+        universe: u16,
+        priorities: &[u8],
+        dst_ip: Option<SocketAddr>,
+    ) -> Result<()> {
+        if !self.running {
+            return Err(SacnError::SenderAlreadyTerminated(
+                "Attempted to send PSP".to_string(),
+            ));
+        }
+
+        self.universe_allowed(&universe)?;
+
+        // The priorities slice maps to DMX slots 1..=512; add 1 for the START Code byte.
+        if priorities.len() > UNIVERSE_CHANNEL_CAPACITY - 1 {
+            return Err(SacnError::ExceedUniverseCapacity(priorities.len()));
+        }
+
+        for &p in priorities {
+            if p > E131_MAX_PRIORITY {
+                return Err(SacnError::InvalidPriority(p));
+            }
+        }
+
+        // PSP shares the sequence number stream with NSC data packets on the same universe.
+        let sequence = match self.data_sequences.borrow().get(&universe) {
+            Some(s) => *s,
+            None => STARTING_SEQUENCE_NUMBER,
+        };
+
+        // Build property_values: START Code 0xDD followed by the priority bytes.
+        let mut property_values = Vec::with_capacity(priorities.len() + 1);
+        property_values.push(E131_PER_SLOT_PRIORITY_START_CODE);
+        property_values.extend_from_slice(priorities);
+
+        let packet = AcnRootLayerProtocol {
+            pdu: E131RootLayer {
+                cid: self.cid,
+                data: E131RootLayerData::DataPacket(DataPacketFramingLayer {
+                    source_name: self.name.as_str().into(),
+                    // Use the protocol default packet priority for PSP packets.
+                    // Matching a universe's live NSC packet priority would require tracking that
+                    // priority in sender state, which this implementation does not currently do.
+                    priority: E131_DEFAULT_PRIORITY,
+                    synchronization_address: NO_SYNC_UNIVERSE,
+                    sequence_number: sequence,
+                    preview_data: self.preview_data,
+                    // Stream_Terminated MUST be 0 for PSP packets (BSR E1.31-1).
+                    stream_terminated: false,
+                    force_synchronization: false,
+                    universe,
+                    data: DataPacketDmpLayer {
+                        property_values: property_values.into(),
+                    },
+                }),
+            },
+        };
+
+        if let Some(dst) = dst_ip {
+            self.socket
+                .send_to(&packet.pack_alloc()?, &dst.into())
+                .map_err(|e| {
+                    std::io::Error::new(e.kind(), "Failed to send PSP unicast on socket")
+                })?;
+        } else {
+            let dst = if self.addr.is_ipv6() {
+                universe_to_ipv6_multicast_addr(universe)?
+            } else {
+                universe_to_ipv4_multicast_addr(universe)?
+            };
+            self.socket
+                .send_to(&packet.pack_alloc()?, &dst)
+                .map_err(|e| {
+                    std::io::Error::new(e.kind(), "Failed to send PSP multicast on socket")
+                })?;
+        }
+
+        // Increment the shared sequence number for this universe.
+        self.data_sequences
+            .borrow_mut()
+            .insert(universe, sequence.wrapping_add(1));
+
+        Ok(())
     }
 }
 
