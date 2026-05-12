@@ -92,6 +92,125 @@ const ANNOUNCE_TIMEOUT_DEFAULT: bool = false;
 const DEFAULT_MERGE_FUNC: fn(&DMXData, &DMXData) -> Result<DMXData> =
     discard_lowest_priority_then_previous;
 
+/// The default value for the `per_slot_priority_mode` flag on newly created receivers.
+/// Disabled by default so that existing users see no behaviour change.
+const PER_SLOT_PRIORITY_MODE_DEFAULT: bool = false;
+
+/// Per-source, per-universe state for the BSR E1.31-1 Per-Slot Priority (PSP) state machine.
+///
+/// Each state represents the receiver's current knowledge about a particular source on a particular
+/// universe, following the transitions defined in BSR E1.31-1.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PspSourceState {
+    /// No data has been received from this source on this universe.
+    Inactive,
+    /// A Null START Code (NSC) packet has been received but no PSP packet has arrived yet.
+    /// The source is treated as a per-universe source while waiting.
+    /// Transitions to `ActivePerSlot` when a PSP arrives, or to `ActivePerUniverse` when
+    /// `PSP_STARTUP_WINDOW` elapses without a PSP.
+    PendingPriority,
+    /// A PSP packet has been received but no NSC packet has arrived yet.
+    /// The source is not contributing to the output until NSC levels arrive.
+    PendingLevels,
+    /// Operating in per-universe priority mode: PSP never arrived (or timed out).
+    /// The source contributes to the merge using the NSC packet priority for all slots.
+    ActivePerUniverse,
+    /// Operating in per-slot priority mode: both NSC and PSP are present.
+    /// The source contributes to the merge using per-slot priorities from the PSP packet.
+    ActivePerSlot,
+}
+
+/// Per-source, per-universe state record used when `per_slot_priority_mode` is enabled.
+#[derive(Clone, Debug)]
+struct PerSlotPriorityEntry {
+    /// Current PSP state machine state.
+    state: PspSourceState,
+    /// Most-recently received NSC property_values (includes the 0x00 START Code byte).
+    nsc_levels: Option<Vec<u8>>,
+    /// Packet-level priority from the most-recently received NSC framing layer.
+    nsc_packet_priority: u8,
+    /// Per-slot priorities extracted from the most-recently received PSP packet (values already
+    /// validated and clamped; length may be < 512, missing slots are treated as 0).
+    psp_priorities: Option<Vec<u8>>,
+    /// When the most-recent NSC packet was received (used for the NSC data-loss timeout).
+    nsc_last_seen: Option<Instant>,
+    /// When the most-recent PSP packet was received (used for the PSP data-loss timeout).
+    psp_last_seen: Option<Instant>,
+    /// When the source entered `PendingPriority` state (used for the startup window timeout).
+    startup_entered: Option<Instant>,
+}
+
+impl PerSlotPriorityEntry {
+    /// Creates a new entry from an arriving NSC packet.
+    fn from_nsc(nsc_levels: Vec<u8>, nsc_packet_priority: u8) -> Self {
+        PerSlotPriorityEntry {
+            state: PspSourceState::PendingPriority,
+            nsc_levels: Some(nsc_levels),
+            nsc_packet_priority,
+            psp_priorities: None,
+            nsc_last_seen: Some(Instant::now()),
+            psp_last_seen: None,
+            startup_entered: Some(Instant::now()),
+        }
+    }
+
+    /// Creates a new entry from an arriving PSP packet.
+    fn from_psp(psp_priorities: Vec<u8>) -> Self {
+        PerSlotPriorityEntry {
+            state: PspSourceState::PendingLevels,
+            nsc_levels: None,
+            nsc_packet_priority: 0,
+            psp_priorities: Some(psp_priorities),
+            nsc_last_seen: None,
+            psp_last_seen: Some(Instant::now()),
+            startup_entered: None,
+        }
+    }
+
+    /// Returns the effective per-slot priority for `slot` (0-indexed, 0 = first DMX slot).
+    ///
+    /// - `ActivePerSlot`: uses PSP priorities (0 if the slot was not present in the PSP packet).
+    /// - `PendingPriority` / `ActivePerUniverse`: uses the NSC packet priority for every slot.
+    /// - `PendingLevels` / `Inactive`: returns 0 (not yet contributing).
+    fn effective_priority(&self, slot: usize) -> u8 {
+        match self.state {
+            PspSourceState::ActivePerSlot => {
+                self.psp_priorities
+                    .as_deref()
+                    .and_then(|p| p.get(slot))
+                    .copied()
+                    .unwrap_or(0)
+            }
+            PspSourceState::PendingPriority | PspSourceState::ActivePerUniverse => {
+                self.nsc_packet_priority
+            }
+            PspSourceState::PendingLevels | PspSourceState::Inactive => 0,
+        }
+    }
+
+    /// Returns the DMX level for `slot` (0-indexed), or `0` if no NSC has been received.
+    ///
+    /// `nsc_levels` includes the START Code byte at index 0.  DMX slot *n* (1-indexed) is stored
+    /// at `nsc_levels[n]`.  We accept the 0-indexed slot argument and add 1 to skip the start code.
+    fn level(&self, slot: usize) -> u8 {
+        self.nsc_levels
+            .as_deref()
+            .and_then(|v| v.get(slot + 1)) // +1 to skip the 0x00 START Code byte
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Returns `true` if this entry is currently contributing to the merge output.
+    fn is_active(&self) -> bool {
+        matches!(
+            self.state,
+            PspSourceState::PendingPriority
+                | PspSourceState::ActivePerUniverse
+                | PspSourceState::ActivePerSlot
+        )
+    }
+}
+
 /// Holds a universes worth of DMX data.
 #[derive(Debug)]
 pub struct DMXData {
@@ -197,6 +316,16 @@ pub struct SacnReceiver {
 
     /// Flag which indicates if an `UniverseTimeout` error should be thrown if it is detected that a source has timed out.
     announce_timeout: bool,
+
+    /// When `true`, the receiver processes Per-Slot Priority (PSP) packets (START Code `0xDD`) and
+    /// uses the BSR E1.31-1 three-phase merge algorithm.
+    ///
+    /// Disabled by default so that existing behaviour is completely unchanged.
+    per_slot_priority_mode: bool,
+
+    /// Per-source, per-universe PSP state.  The key is `(source CID, universe)`.
+    /// Only populated when `per_slot_priority_mode` is `true`.
+    psp_entries: HashMap<(Uuid, u16), PerSlotPriorityEntry>,
 }
 
 /// Represents an sACN source/sender on the network that has been discovered by this sACN receiver by receiving universe discovery packets.
@@ -255,7 +384,8 @@ impl fmt::Debug for SacnReceiver {
         write!(f, "{:?}", self.waiting_data)?;
         write!(f, "{:?}", self.universes)?;
         write!(f, "{:?}", self.discovered_sources)?;
-        write!(f, "{:?}", self.partially_discovered_sources)
+        write!(f, "{:?}", self.partially_discovered_sources)?;
+        write!(f, "per_slot_priority_mode: {:?}", self.per_slot_priority_mode)
     }
 }
 
@@ -306,6 +436,8 @@ impl SacnReceiver {
             announce_source_discovery: ANNOUNCE_SOURCE_DISCOVERY_DEFAULT,
             announce_stream_termination: ANNOUNCE_STREAM_TERMINATION_DEFAULT,
             announce_timeout: ANNOUNCE_TIMEOUT_DEFAULT,
+            per_slot_priority_mode: PER_SLOT_PRIORITY_MODE_DEFAULT,
+            psp_entries: HashMap::new(),
         };
 
         sri.listen_universes(&[E131_DISCOVERY_UNIVERSE])?;
@@ -510,6 +642,7 @@ impl SacnReceiver {
             // always check timeouts
             self.sequences.check_timeouts(self.announce_timeout)?;
             self.check_waiting_data_timeouts();
+            self.check_psp_timeouts();
             return Err(io::Error::new(
                 // Use the right expected error for the operating system.
                 if cfg!(target_os = "windows") {
@@ -531,6 +664,7 @@ impl SacnReceiver {
         loop {
             self.sequences.check_timeouts(self.announce_timeout)?;
             self.check_waiting_data_timeouts();
+            self.check_psp_timeouts();
 
             // In the case of `timeout` being longer than `E131_NETWORK_DATA_LOSS_TIMEOUT`:
             // Forces the actual timeout used for receiving from the underlying network to never exceed E131_NETWORK_DATA_LOSS_TIMEOUT.
@@ -684,12 +818,55 @@ impl SacnReceiver {
         self.announce_stream_termination = new_val;
     }
 
+    /// Returns the current value of the `per_slot_priority_mode` flag.
+    ///
+    /// When `true`, the receiver processes PSP packets (START Code `0xDD`) and uses the BSR E1.31-1
+    /// three-phase per-slot priority merge algorithm.  When `false` (default), PSP packets are
+    /// silently ignored and the receiver behaves exactly as a standard ANSI E1.31-2018 receiver.
+    pub fn get_per_slot_priority_mode(&self) -> bool {
+        self.per_slot_priority_mode
+    }
+
+    /// Sets the `per_slot_priority_mode` flag.
+    ///
+    /// Setting this to `true` opts the receiver into PSP-aware processing.
+    /// Setting it back to `false` clears all accumulated PSP state.
+    ///
+    /// # Arguments
+    /// `new_val`: The new value for the flag.
+    pub fn set_per_slot_priority_mode(&mut self, new_val: bool) {
+        self.per_slot_priority_mode = new_val;
+        if !new_val {
+            self.psp_entries.clear();
+        }
+    }
+
+    /// Returns a snapshot of the PSP state for `(source_cid, universe)`, or `None` if no entry
+    /// exists.
+    ///
+    /// This is primarily useful for testing and diagnostics.
+    pub fn psp_source_state(&self, cid: Uuid, universe: u16) -> Option<PspSourceState> {
+        self.psp_entries.get(&(cid, universe)).map(|e| e.state.clone())
+    }
+
+    /// Creates a stub `SacnReceiver` without an underlying network socket.
+    /// Intended for use in unit tests that exercise PSP logic without the network layer.
+    #[doc(hidden)]
+    pub fn with_stub() -> SacnReceiver {
+        use std::net::{IpAddr, Ipv4Addr};
+        let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        SacnReceiver::with_ip(ip, None).expect("stub receiver creation failed")
+    }
+
     /// Handles the given data packet for this DMX receiver.
     ///
     /// Returns the universe data if successful.
     /// If the returned value is None it indicates that the data was received successfully but isn't ready to act on.
     ///
     /// Synchronised data packets handled as per ANSI E1.31-2018 Section 6.2.4.1.
+    ///
+    /// When `per_slot_priority_mode` is enabled, packets with START Code `0xDD` are handled as
+    /// Per-Slot Priority (PSP) packets and NSC packets trigger the BSR E1.31-1 three-phase merge.
     ///
     /// Arguments:
     /// `data_pkt`: The sACN data packet to handle.
@@ -736,6 +913,16 @@ impl SacnReceiver {
             self.announce_timeout,
         )?;
 
+        // When per-slot priority mode is enabled, route PSP (0xDD) and NSC (0x00) packets
+        // through the PSP state machine and merge algorithm.
+        if self.per_slot_priority_mode {
+            if data_pkt.is_per_slot_priority_packet() {
+                return self.handle_psp_packet(cid, data_pkt);
+            } else {
+                return self.handle_nsc_packet_psp_mode(cid, data_pkt);
+            }
+        }
+
         if data_pkt.synchronization_address == E131_NO_SYNC_ADDR {
             self.clear_waiting_data(data_pkt.universe);
 
@@ -769,6 +956,235 @@ impl SacnReceiver {
 
             self.store_waiting_data(dmx_data)?;
             Ok(None)
+        }
+    }
+
+    /// Handles a Per-Slot Priority (PSP) packet when `per_slot_priority_mode` is enabled.
+    ///
+    /// Updates the PSP state machine entry for `(cid, universe)` and returns `None` because PSP
+    /// packets do not carry DMX levels and therefore do not produce new output on their own.
+    fn handle_psp_packet(
+        &mut self,
+        cid: Uuid,
+        data_pkt: DataPacketFramingLayer<'_>,
+    ) -> Result<Option<Vec<DMXData>>> {
+        // PSP stream_terminated MUST be 0 per BSR E1.31-1; if set, ignore this packet.
+        if data_pkt.stream_terminated {
+            return Ok(None);
+        }
+
+        let priorities = data_pkt.data.per_slot_priorities();
+        let universe = data_pkt.universe;
+
+        let entry = self.psp_entries.entry((cid, universe)).or_insert_with(|| {
+            PerSlotPriorityEntry::from_psp(priorities.clone())
+        });
+
+        // Update PSP data and timestamp.
+        entry.psp_priorities = Some(priorities);
+        entry.psp_last_seen = Some(Instant::now());
+
+        // State transitions on PSP arrival.
+        match entry.state {
+            PspSourceState::Inactive => {
+                entry.state = PspSourceState::PendingLevels;
+            }
+            PspSourceState::PendingPriority => {
+                // NSC was already received; now we have PSP too.
+                entry.state = PspSourceState::ActivePerSlot;
+                entry.startup_entered = None;
+            }
+            PspSourceState::PendingLevels => {
+                // Still waiting for NSC; stay in PendingLevels.
+            }
+            PspSourceState::ActivePerUniverse => {
+                // PSP has arrived for a source that was operating per-universe.
+                entry.state = PspSourceState::ActivePerSlot;
+            }
+            PspSourceState::ActivePerSlot => {
+                // Refresh in-place; state doesn't change.
+            }
+        }
+
+        Ok(None) // PSP packets never produce immediate output.
+    }
+
+    /// Handles an NSC packet when `per_slot_priority_mode` is enabled.
+    ///
+    /// Updates the PSP state machine entry for `(cid, universe)`, then computes and returns the
+    /// merged output across all known active sources for that universe.
+    fn handle_nsc_packet_psp_mode(
+        &mut self,
+        cid: Uuid,
+        data_pkt: DataPacketFramingLayer<'_>,
+    ) -> Result<Option<Vec<DMXData>>> {
+        let universe = data_pkt.universe;
+        let priority = data_pkt.priority;
+        let sync_uni = data_pkt.synchronization_address;
+        let preview = data_pkt.preview_data;
+        let nsc_levels: Vec<u8> = data_pkt.data.property_values.into_owned();
+
+        {
+            let entry = self.psp_entries.entry((cid, universe)).or_insert_with(|| {
+                PerSlotPriorityEntry::from_nsc(nsc_levels.clone(), priority)
+            });
+
+            // Update NSC data and timestamp.
+            entry.nsc_levels = Some(nsc_levels);
+            entry.nsc_packet_priority = priority;
+            entry.nsc_last_seen = Some(Instant::now());
+
+            // State transitions on NSC arrival.
+            match entry.state {
+                PspSourceState::Inactive => {
+                    entry.state = PspSourceState::PendingPriority;
+                    entry.startup_entered = Some(Instant::now());
+                }
+                PspSourceState::PendingPriority => {
+                    // Still waiting for PSP; refresh levels and remain in PendingPriority.
+                }
+                PspSourceState::PendingLevels => {
+                    // PSP was already received; now we have NSC too.
+                    entry.state = PspSourceState::ActivePerSlot;
+                    entry.startup_entered = None;
+                }
+                PspSourceState::ActivePerUniverse | PspSourceState::ActivePerSlot => {
+                    // Refresh in-place; state machine handles PSP timeouts separately.
+                }
+            }
+        }
+
+        // Compute the merged output for this universe across all known active sources.
+        let merged = self.compute_psp_merge(universe, sync_uni, preview);
+        if let Some(dmx_data) = merged {
+            Ok(Some(vec![dmx_data]))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Runs the BSR E1.31-1 three-phase per-slot priority merge for `universe`.
+    ///
+    /// Phase 1 – Identify per-universe contributors: all entries in state `PendingPriority` or
+    ///   `ActivePerUniverse`.  Their effective priority for every slot equals the NSC packet
+    ///   priority.
+    ///
+    /// Phase 2 – Per-slot arbitration: for each slot pick the entry (or entries) with the highest
+    ///   effective priority.  PSP sources use their per-slot priority; per-universe sources use
+    ///   their packet priority.  A per-slot priority of `0` means "source releases this slot" and
+    ///   the source is excluded from the arbitration for that slot.
+    ///
+    /// Phase 3 – Tie-breaking: when multiple sources share the highest priority for a slot, the
+    ///   highest DMX level value (HTP) is used.
+    ///
+    /// Returns `None` if there are no active contributors for `universe`.
+    fn compute_psp_merge(&self, universe: u16, sync_uni: u16, preview: bool) -> Option<DMXData> {
+        // Gather all entries that are contributing to this universe.
+        let contributors: Vec<&PerSlotPriorityEntry> = self
+            .psp_entries
+            .iter()
+            .filter(|((_, uni), entry)| *uni == universe && entry.is_active())
+            .map(|(_, entry)| entry)
+            .collect();
+
+        if contributors.is_empty() {
+            return None;
+        }
+
+        // The merged output starts with the NSC START Code byte (0x00) followed by 512 slots.
+        let mut merged_values: Vec<u8> = vec![0u8; 513]; // index 0 = start code 0x00
+        let mut max_priority: u8 = 0;
+
+        for slot in 0..512usize {
+            // Find the highest effective priority among contributors for this slot.
+            let highest_prio = contributors
+                .iter()
+                .map(|e| e.effective_priority(slot))
+                .max()
+                .unwrap_or(0);
+
+            if highest_prio == 0 {
+                // No source is asserting control of this slot; leave it at 0.
+                continue;
+            }
+
+            max_priority = max_priority.max(highest_prio);
+
+            // Among contributors at the highest priority, pick the highest level (HTP).
+            let htp_level = contributors
+                .iter()
+                .filter(|e| e.effective_priority(slot) == highest_prio)
+                .map(|e| e.level(slot))
+                .max()
+                .unwrap_or(0);
+
+            merged_values[slot + 1] = htp_level; // +1 to skip START Code byte
+        }
+
+        Some(DMXData {
+            universe,
+            values: merged_values,
+            sync_uni,
+            priority: max_priority,
+            src_cid: None, // Merged from multiple sources.
+            preview,
+            recv_timestamp: Instant::now(),
+        })
+    }
+
+    /// Checks and updates PSP state machine timeouts for all tracked entries.
+    ///
+    /// Called from the `recv` loop to ensure timely state transitions even when no packets are
+    /// arriving.
+    ///
+    /// Applies the following timeout rules:
+    /// - NSC `E131_NETWORK_DATA_LOSS_TIMEOUT` elapsed since `nsc_last_seen` → transition to
+    ///   `Inactive` and remove the entry.
+    /// - PSP `E131_NETWORK_DATA_LOSS_TIMEOUT` elapsed since `psp_last_seen` → downgrade from
+    ///   `ActivePerSlot` to `ActivePerUniverse`.
+    /// - `PSP_STARTUP_WINDOW` elapsed since `startup_entered` (in `PendingPriority`) → transition
+    ///   to `ActivePerUniverse`.
+    fn check_psp_timeouts(&mut self) {
+        let now = Instant::now();
+
+        let mut to_remove: Vec<(Uuid, u16)> = Vec::new();
+
+        for (key, entry) in self.psp_entries.iter_mut() {
+            // NSC timeout → Inactive (remove entry).
+            let nsc_timed_out = entry
+                .nsc_last_seen
+                .map_or(false, |t| now.duration_since(t) >= E131_NETWORK_DATA_LOSS_TIMEOUT);
+            if nsc_timed_out {
+                to_remove.push(*key);
+                continue;
+            }
+
+            // PSP startup window expired → ActivePerUniverse.
+            if entry.state == PspSourceState::PendingPriority {
+                let startup_expired = entry
+                    .startup_entered
+                    .map_or(false, |t| now.duration_since(t) >= PSP_STARTUP_WINDOW);
+                if startup_expired {
+                    entry.state = PspSourceState::ActivePerUniverse;
+                    entry.startup_entered = None;
+                }
+            }
+
+            // PSP data-loss timeout → downgrade from ActivePerSlot to ActivePerUniverse.
+            if entry.state == PspSourceState::ActivePerSlot {
+                let psp_timed_out = entry
+                    .psp_last_seen
+                    .map_or(false, |t| now.duration_since(t) >= E131_NETWORK_DATA_LOSS_TIMEOUT);
+                if psp_timed_out {
+                    entry.state = PspSourceState::ActivePerUniverse;
+                    entry.psp_priorities = None;
+                    entry.psp_last_seen = None;
+                }
+            }
+        }
+
+        for key in to_remove {
+            self.psp_entries.remove(&key);
         }
     }
 
@@ -2114,6 +2530,154 @@ pub fn htp_dmx_merge(i: &DMXData, n: &DMXData) -> Result<DMXData> {
     }
 
     Ok(r)
+}
+
+// ---------------------------------------------------------------------------
+// Public test helpers – exposed for integration tests in tests/psp_tests.rs
+// ---------------------------------------------------------------------------
+
+/// A public wrapper around `PerSlotPriorityEntry` for use in integration tests.
+///
+/// This type exists solely to allow tests outside this crate to inspect and mutate PSP
+/// state entries without requiring direct field access to the private `PerSlotPriorityEntry`.
+#[doc(hidden)]
+pub struct PerSlotPriorityEntryTest {
+    pub state: PspSourceState,
+    pub nsc_levels: Option<Vec<u8>>,
+    pub nsc_packet_priority: u8,
+    pub psp_priorities: Option<Vec<u8>>,
+    pub nsc_last_seen: Option<Instant>,
+    pub psp_last_seen: Option<Instant>,
+    pub startup_entered: Option<Instant>,
+}
+
+impl PerSlotPriorityEntryTest {
+    /// Constructs a test entry as if an NSC packet just arrived.
+    pub fn from_nsc(nsc_levels: Vec<u8>, nsc_packet_priority: u8) -> Self {
+        let inner = PerSlotPriorityEntry::from_nsc(nsc_levels, nsc_packet_priority);
+        PerSlotPriorityEntryTest {
+            state: inner.state,
+            nsc_levels: inner.nsc_levels,
+            nsc_packet_priority: inner.nsc_packet_priority,
+            psp_priorities: inner.psp_priorities,
+            nsc_last_seen: inner.nsc_last_seen,
+            psp_last_seen: inner.psp_last_seen,
+            startup_entered: inner.startup_entered,
+        }
+    }
+
+    /// Constructs a test entry as if a PSP packet just arrived.
+    pub fn from_psp(psp_priorities: Vec<u8>) -> Self {
+        let inner = PerSlotPriorityEntry::from_psp(psp_priorities);
+        PerSlotPriorityEntryTest {
+            state: inner.state,
+            nsc_levels: inner.nsc_levels,
+            nsc_packet_priority: inner.nsc_packet_priority,
+            psp_priorities: inner.psp_priorities,
+            nsc_last_seen: inner.nsc_last_seen,
+            psp_last_seen: inner.psp_last_seen,
+            startup_entered: inner.startup_entered,
+        }
+    }
+
+    /// Overrides the state (for testing transitions from a known starting point).
+    pub fn set_state(&mut self, state: PspSourceState) {
+        self.state = state;
+    }
+
+    /// Sets (or replaces) the NSC levels and packet priority.
+    pub fn set_nsc(&mut self, nsc_levels: Vec<u8>, nsc_packet_priority: u8) {
+        self.nsc_levels = Some(nsc_levels);
+        self.nsc_packet_priority = nsc_packet_priority;
+        self.nsc_last_seen = Some(Instant::now());
+    }
+
+    /// Returns the effective per-slot priority for `slot` (0-indexed).
+    pub fn effective_priority(&self, slot: usize) -> u8 {
+        let inner = self.as_inner();
+        inner.effective_priority(slot)
+    }
+
+    /// Returns the DMX level for `slot` (0-indexed, skipping START Code byte).
+    pub fn level(&self, slot: usize) -> u8 {
+        let inner = self.as_inner();
+        inner.level(slot)
+    }
+
+    /// Returns `true` if this entry is actively contributing to the merge.
+    pub fn is_active(&self) -> bool {
+        let inner = self.as_inner();
+        inner.is_active()
+    }
+
+    fn as_inner(&self) -> PerSlotPriorityEntry {
+        PerSlotPriorityEntry {
+            state: self.state.clone(),
+            nsc_levels: self.nsc_levels.clone(),
+            nsc_packet_priority: self.nsc_packet_priority,
+            psp_priorities: self.psp_priorities.clone(),
+            nsc_last_seen: self.nsc_last_seen,
+            psp_last_seen: self.psp_last_seen,
+            startup_entered: self.startup_entered,
+        }
+    }
+}
+
+/// A test harness for exercising the PSP three-phase merge algorithm in isolation.
+///
+/// Allows tests to add sources with specific NSC levels, packet priorities and PSP slot
+/// priorities and then call `merge()` to inspect the result.
+#[doc(hidden)]
+pub struct PspMergeTestHarness {
+    universe: u16,
+    entries: HashMap<(Uuid, u16), PerSlotPriorityEntry>,
+}
+
+impl PspMergeTestHarness {
+    /// Creates a new harness targeting `universe`.
+    pub fn new(universe: u16) -> Self {
+        PspMergeTestHarness {
+            universe,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Adds a source in `ActivePerUniverse` state (NSC only, no PSP).
+    ///
+    /// `nsc_packet_priority` is used as the effective priority for every slot.
+    /// `nsc_levels` should include the `0x00` START Code byte at index 0.
+    pub fn add_per_universe(&mut self, cid: Uuid, nsc_packet_priority: u8, nsc_levels: Vec<u8>) {
+        let mut entry = PerSlotPriorityEntry::from_nsc(nsc_levels, nsc_packet_priority);
+        entry.state = PspSourceState::ActivePerUniverse;
+        self.entries.insert((cid, self.universe), entry);
+    }
+
+    /// Adds a source in `ActivePerSlot` state (both NSC and PSP present).
+    ///
+    /// `nsc_levels` should include the `0x00` START Code byte at index 0.
+    /// `psp_priorities` should NOT include a START Code byte; it maps directly to slot indices.
+    pub fn add_per_slot(
+        &mut self,
+        cid: Uuid,
+        nsc_packet_priority: u8,
+        nsc_levels: Vec<u8>,
+        psp_priorities: Vec<u8>,
+    ) {
+        let mut entry = PerSlotPriorityEntry::from_nsc(nsc_levels, nsc_packet_priority);
+        entry.psp_priorities = Some(psp_priorities);
+        entry.psp_last_seen = Some(Instant::now());
+        entry.state = PspSourceState::ActivePerSlot;
+        self.entries.insert((cid, self.universe), entry);
+    }
+
+    /// Runs the merge algorithm and returns the result, or `None` if there are no active sources.
+    pub fn merge(&self) -> Option<DMXData> {
+        // We need a SacnReceiver to call compute_psp_merge; build a stub receiver and
+        // populate its psp_entries map directly, then delegate.
+        let mut stub = SacnReceiver::with_stub();
+        stub.psp_entries = self.entries.clone();
+        stub.compute_psp_merge(self.universe, 0, false)
+    }
 }
 
 #[cfg(test)]

@@ -303,6 +303,20 @@ pub const VECTOR_DMP_SET_PROPERTY: u8 = 0x02;
 /// Value as defined in ANSI E1.31-2018 Appendix A: Defined Parameters (Normative).
 pub const VECTOR_UNIVERSE_DISCOVERY_UNIVERSE_LIST: u32 = 0x0000_0001;
 
+/// The START Code for Per-Slot Priority (PSP) packets as defined in BSR E1.31-1.
+/// A data packet with this START Code carries per-slot priority values instead of DMX levels.
+/// Values in the property values field (after the START Code byte) are priority bytes in the range [0, 200].
+/// A slot priority value of 0 indicates that the source is releasing control of that slot.
+pub const E131_PER_SLOT_PRIORITY_START_CODE: u8 = 0xDD;
+
+/// The minimum number of PSP packets a sender must transmit within PSP_STARTUP_WINDOW during startup
+/// to establish per-slot priority mode.
+pub const PSP_STARTUP_MIN_PACKETS: u32 = 3;
+
+/// The time window within which a sender must transmit PSP_STARTUP_MIN_PACKETS PSP packets during
+/// startup to establish per-slot priority mode.
+pub const PSP_STARTUP_WINDOW: Duration = Duration::from_millis(1500);
+
 /// The port number used for the ACN family of protocols and therefore the sACN protocol.
 /// As defined in ANSI E1.31-2018 Appendix A: Defined Parameters (Normative)
 pub const ACN_SDT_MULTICAST_PORT: u16 = 5568;
@@ -1076,6 +1090,53 @@ macro_rules! impl_data_packet_dmp_layer {
 }
 
 impl_data_packet_dmp_layer!(<'a>);
+
+impl<'a> DataPacketDmpLayer<'a> {
+    /// Returns `true` if the property values start with the Per-Slot Priority (PSP) START Code (`0xDD`).
+    ///
+    /// A PSP packet carries per-slot priority data rather than DMX levels.  The first byte of
+    /// `property_values` is the START Code:
+    /// - `0x00` → Null START Code (normal DMX levels)
+    /// - `0xDD` → Per-Slot Priority
+    pub fn is_per_slot_priority_packet(&self) -> bool {
+        self.property_values
+            .first()
+            .copied()
+            .unwrap_or(0)
+            == E131_PER_SLOT_PRIORITY_START_CODE
+    }
+
+    /// Extracts and validates the per-slot priority values from a PSP packet.
+    ///
+    /// The first byte of `property_values` is the START Code and is skipped.
+    /// Each remaining byte is a priority in the range `[0, 200]`.  Values above 200 are invalid
+    /// per the BSR E1.31-1 specification and are clamped to `0` (treated as "source releases
+    /// this slot").
+    ///
+    /// Returns a `Vec<u8>` of length equal to the number of priority bytes in the packet.
+    /// Slots not present in the packet (i.e. the packet is shorter than 513 bytes) are treated
+    /// as priority `0` by callers.
+    ///
+    /// # Note
+    /// Callers should first call [`is_per_slot_priority_packet`] to ensure this is a PSP packet.
+    pub fn per_slot_priorities(&self) -> Vec<u8> {
+        self.property_values
+            .iter()
+            .skip(1) // skip the START Code byte
+            .map(|&p| if p > E131_MAX_PRIORITY { 0 } else { p })
+            .collect()
+    }
+}
+
+impl<'a> DataPacketFramingLayer<'a> {
+    /// Returns `true` if this data packet is a Per-Slot Priority (PSP) packet.
+    ///
+    /// A PSP packet has START Code `0xDD` as the first byte of `property_values` in the DMP layer.
+    /// When `true`, `data.per_slot_priorities()` should be used to extract the priority bytes.
+    pub fn is_per_slot_priority_packet(&self) -> bool {
+        self.data.is_per_slot_priority_packet()
+    }
+}
 
 /// sACN synchronization packet PDU.
 #[derive(Clone, Eq, PartialEq, Hash, Debug, Copy)]
