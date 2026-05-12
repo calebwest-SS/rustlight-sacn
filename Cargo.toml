@@ -33,6 +33,7 @@ serial_test = { version = "3.2.0", features = ["file_locks"] }
 [features]
 default = ["std"]
 std = []
+psp = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(ci)'] }

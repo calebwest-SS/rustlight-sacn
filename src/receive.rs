@@ -92,10 +92,12 @@ const ANNOUNCE_TIMEOUT_DEFAULT: bool = false;
 const DEFAULT_MERGE_FUNC: fn(&DMXData, &DMXData) -> Result<DMXData> =
     discard_lowest_priority_then_previous;
 
+#[cfg(feature = "psp")]
 /// The default value for the `per_slot_priority_mode` flag on newly created receivers.
 /// Disabled by default so that existing users see no behavior change.
 const PER_SLOT_PRIORITY_MODE_DEFAULT: bool = false;
 
+#[cfg(feature = "psp")]
 /// Per-source, per-universe state for the BSR E1.31-1 Per-Slot Priority (PSP) state machine.
 ///
 /// Each state represents the receiver's current knowledge about a particular source on a particular
@@ -120,6 +122,7 @@ pub enum PspSourceState {
     ActivePerSlot,
 }
 
+#[cfg(feature = "psp")]
 /// Per-source, per-universe state record used when `per_slot_priority_mode` is enabled.
 #[derive(Clone, Debug)]
 struct PerSlotPriorityEntry {
@@ -140,6 +143,7 @@ struct PerSlotPriorityEntry {
     startup_entered: Option<Instant>,
 }
 
+#[cfg(feature = "psp")]
 impl PerSlotPriorityEntry {
     /// Creates a new entry from an arriving NSC packet.
     fn from_nsc(nsc_levels: Vec<u8>, nsc_packet_priority: u8) -> Self {
@@ -317,12 +321,14 @@ pub struct SacnReceiver {
     /// Flag which indicates if an `UniverseTimeout` error should be thrown if it is detected that a source has timed out.
     announce_timeout: bool,
 
+    #[cfg(feature = "psp")]
     /// When `true`, the receiver processes Per-Slot Priority (PSP) packets (START Code `0xDD`) and
     /// uses the BSR E1.31-1 three-phase merge algorithm.
     ///
-    /// Disabled by default so that existing behaviour is completely unchanged.
+    /// Disabled by default so that existing behavior is completely unchanged.
     per_slot_priority_mode: bool,
 
+    #[cfg(feature = "psp")]
     /// Per-source, per-universe PSP state.  The key is `(source CID, universe)`.
     /// Only populated when `per_slot_priority_mode` is `true`.
     psp_entries: HashMap<(Uuid, u16), PerSlotPriorityEntry>,
@@ -385,7 +391,9 @@ impl fmt::Debug for SacnReceiver {
         write!(f, "{:?}", self.universes)?;
         write!(f, "{:?}", self.discovered_sources)?;
         write!(f, "{:?}", self.partially_discovered_sources)?;
-        write!(f, "per_slot_priority_mode: {:?}", self.per_slot_priority_mode)
+        #[cfg(feature = "psp")]
+        write!(f, "per_slot_priority_mode: {:?}", self.per_slot_priority_mode)?;
+        Ok(())
     }
 }
 
@@ -436,7 +444,9 @@ impl SacnReceiver {
             announce_source_discovery: ANNOUNCE_SOURCE_DISCOVERY_DEFAULT,
             announce_stream_termination: ANNOUNCE_STREAM_TERMINATION_DEFAULT,
             announce_timeout: ANNOUNCE_TIMEOUT_DEFAULT,
+            #[cfg(feature = "psp")]
             per_slot_priority_mode: PER_SLOT_PRIORITY_MODE_DEFAULT,
+            #[cfg(feature = "psp")]
             psp_entries: HashMap::new(),
         };
 
@@ -642,6 +652,7 @@ impl SacnReceiver {
             // always check timeouts
             self.sequences.check_timeouts(self.announce_timeout)?;
             self.check_waiting_data_timeouts();
+            #[cfg(feature = "psp")]
             self.check_psp_timeouts();
             return Err(io::Error::new(
                 // Use the right expected error for the operating system.
@@ -664,6 +675,7 @@ impl SacnReceiver {
         loop {
             self.sequences.check_timeouts(self.announce_timeout)?;
             self.check_waiting_data_timeouts();
+            #[cfg(feature = "psp")]
             self.check_psp_timeouts();
 
             // In the case of `timeout` being longer than `E131_NETWORK_DATA_LOSS_TIMEOUT`:
@@ -818,6 +830,7 @@ impl SacnReceiver {
         self.announce_stream_termination = new_val;
     }
 
+    #[cfg(feature = "psp")]
     /// Returns the current value of the `per_slot_priority_mode` flag.
     ///
     /// When `true`, the receiver processes PSP packets (START Code `0xDD`) and uses the BSR E1.31-1
@@ -827,6 +840,7 @@ impl SacnReceiver {
         self.per_slot_priority_mode
     }
 
+    #[cfg(feature = "psp")]
     /// Sets the `per_slot_priority_mode` flag.
     ///
     /// Setting this to `true` opts the receiver into PSP-aware processing.
@@ -841,6 +855,7 @@ impl SacnReceiver {
         }
     }
 
+    #[cfg(feature = "psp")]
     /// Returns a snapshot of the PSP state for `(source_cid, universe)`, or `None` if no entry
     /// exists.
     ///
@@ -849,6 +864,7 @@ impl SacnReceiver {
         self.psp_entries.get(&(cid, universe)).map(|e| e.state.clone())
     }
 
+    #[cfg(feature = "psp")]
     /// Creates a stub `SacnReceiver` without an underlying network socket.
     /// Intended for use in unit tests that exercise PSP logic without the network layer.
     #[doc(hidden)]
@@ -913,6 +929,7 @@ impl SacnReceiver {
             self.announce_timeout,
         )?;
 
+        #[cfg(feature = "psp")]
         // When per-slot priority mode is enabled, route PSP (0xDD) and NSC (0x00) packets
         // through the PSP state machine and merge algorithm.
         if self.per_slot_priority_mode {
@@ -959,6 +976,7 @@ impl SacnReceiver {
         }
     }
 
+    #[cfg(feature = "psp")]
     /// Handles a Per-Slot Priority (PSP) packet when `per_slot_priority_mode` is enabled.
     ///
     /// Updates the PSP state machine entry for `(cid, universe)` and returns `None` because PSP
@@ -1009,6 +1027,7 @@ impl SacnReceiver {
         Ok(None) // PSP packets never produce immediate output.
     }
 
+    #[cfg(feature = "psp")]
     /// Handles an NSC packet when `per_slot_priority_mode` is enabled.
     ///
     /// Updates the PSP state machine entry for `(cid, universe)`, then computes and returns the
@@ -1063,6 +1082,7 @@ impl SacnReceiver {
         }
     }
 
+    #[cfg(feature = "psp")]
     /// Runs the BSR E1.31-1 three-phase per-slot priority merge for `universe`.
     ///
     /// Phase 1 – Identify per-universe contributors: all entries in state `PendingPriority` or
@@ -1132,6 +1152,7 @@ impl SacnReceiver {
         })
     }
 
+    #[cfg(feature = "psp")]
     /// Checks and updates PSP state machine timeouts for all tracked entries.
     ///
     /// Called from the `recv` loop to ensure timely state transitions even when no packets are
@@ -2536,6 +2557,7 @@ pub fn htp_dmx_merge(i: &DMXData, n: &DMXData) -> Result<DMXData> {
 // Public test helpers – exposed for integration tests in tests/psp_tests.rs
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "psp")]
 /// A public wrapper around `PerSlotPriorityEntry` for use in integration tests.
 ///
 /// This type exists solely to allow tests outside this crate to inspect and mutate PSP
@@ -2551,6 +2573,7 @@ pub struct PerSlotPriorityEntryTest {
     pub startup_entered: Option<Instant>,
 }
 
+#[cfg(feature = "psp")]
 impl PerSlotPriorityEntryTest {
     /// Constructs a test entry as if an NSC packet just arrived.
     pub fn from_nsc(nsc_levels: Vec<u8>, nsc_packet_priority: u8) -> Self {
@@ -2623,6 +2646,7 @@ impl PerSlotPriorityEntryTest {
     }
 }
 
+#[cfg(feature = "psp")]
 /// A test harness for exercising the PSP three-phase merge algorithm in isolation.
 ///
 /// Allows tests to add sources with specific NSC levels, packet priorities and PSP slot
@@ -2633,6 +2657,7 @@ pub struct PspMergeTestHarness {
     entries: HashMap<(Uuid, u16), PerSlotPriorityEntry>,
 }
 
+#[cfg(feature = "psp")]
 impl PspMergeTestHarness {
     /// Creates a new harness targeting `universe`.
     pub fn new(universe: u16) -> Self {

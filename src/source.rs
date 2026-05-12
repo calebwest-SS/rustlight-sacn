@@ -517,6 +517,7 @@ impl SacnSource {
         Ok(unlock_internal(&self.internal)?.universes())
     }
 
+    #[cfg(feature = "psp")]
     /// Sends a Per-Slot Priority (PSP) packet for the given universe as defined in BSR E1.31-1.
     ///
     /// A PSP packet carries per-slot priority values (START Code `0xDD`) allowing a source to
@@ -1253,6 +1254,7 @@ impl SacnSourceInternal {
         self.universes.clone()
     }
 
+    #[cfg(feature = "psp")]
     /// Sends a Per-Slot Priority (PSP) packet for the given universe as defined in BSR E1.31-1.
     ///
     /// A PSP packet uses START Code `0xDD` and carries per-slot priority bytes rather than DMX levels.

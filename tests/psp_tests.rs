@@ -16,6 +16,7 @@
 //   - Sender PSP packet construction
 
 #![cfg_attr(rustfmt, rustfmt_skip)]
+#![cfg(feature = "psp")]
 
 #[cfg(test)]
 mod psp_tests {

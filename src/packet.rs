@@ -303,16 +303,19 @@ pub const VECTOR_DMP_SET_PROPERTY: u8 = 0x02;
 /// Value as defined in ANSI E1.31-2018 Appendix A: Defined Parameters (Normative).
 pub const VECTOR_UNIVERSE_DISCOVERY_UNIVERSE_LIST: u32 = 0x0000_0001;
 
+#[cfg(feature = "psp")]
 /// The START Code for Per-Slot Priority (PSP) packets as defined in BSR E1.31-1.
 /// A data packet with this START Code carries per-slot priority values instead of DMX levels.
 /// Values in the property values field (after the START Code byte) are priority bytes in the range [0, 200].
 /// A slot priority value of 0 indicates that the source is releasing control of that slot.
 pub const E131_PER_SLOT_PRIORITY_START_CODE: u8 = 0xDD;
 
+#[cfg(feature = "psp")]
 /// The minimum number of PSP packets a sender must transmit within PSP_STARTUP_WINDOW during startup
 /// to establish per-slot priority mode.
 pub const PSP_STARTUP_MIN_PACKETS: u32 = 3;
 
+#[cfg(feature = "psp")]
 /// The time window within which a sender must transmit PSP_STARTUP_MIN_PACKETS PSP packets during
 /// startup to establish per-slot priority mode.
 pub const PSP_STARTUP_WINDOW: Duration = Duration::from_millis(1500);
@@ -1091,6 +1094,7 @@ macro_rules! impl_data_packet_dmp_layer {
 
 impl_data_packet_dmp_layer!(<'a>);
 
+#[cfg(feature = "psp")]
 impl<'a> DataPacketDmpLayer<'a> {
     /// Returns `true` if the property values start with the Per-Slot Priority (PSP) START Code (`0xDD`).
     ///
@@ -1128,6 +1132,7 @@ impl<'a> DataPacketDmpLayer<'a> {
     }
 }
 
+#[cfg(feature = "psp")]
 impl<'a> DataPacketFramingLayer<'a> {
     /// Returns `true` if this data packet is a Per-Slot Priority (PSP) packet.
     ///
